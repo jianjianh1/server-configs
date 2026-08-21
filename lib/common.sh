@@ -155,6 +155,130 @@ base64_decode_cmd() {
     fi
 }
 
+# Resolve the rclone config location without requiring rclone itself. Prefer an
+# explicit override, then the XDG/default locations used by current rclone,
+# and finally the legacy ~/.rclone.conf when it already exists.
+rclone_config_file() {
+    if [ -n "${RCLONE_CONFIG:-}" ]; then
+        printf '%s\n' "$RCLONE_CONFIG"
+    elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s/rclone/rclone.conf\n' "$XDG_CONFIG_HOME"
+    elif [ -f "$HOME/.config/rclone/rclone.conf" ] || [ ! -f "$HOME/.rclone.conf" ]; then
+        printf '%s/.config/rclone/rclone.conf\n' "$HOME"
+    else
+        printf '%s/.rclone.conf\n' "$HOME"
+    fi
+}
+
+# Print one INI section verbatim. Callers must treat stdout as secret material:
+# an rclone remote section contains OAuth tokens and client credentials.
+rclone_extract_remote_section() {
+    local config_file="$1" remote_name="$2"
+
+    awk -v wanted="[$remote_name]" '
+        /^\[[^]]+\][[:space:]]*$/ {
+            if (inside && $0 != wanted) exit
+            inside = ($0 == wanted)
+        }
+        inside { print }
+    ' "$config_file"
+}
+
+# Validate the exact Google Drive profile this repo deploys. Requiring an
+# explicit full-drive scope and client credentials prevents accidentally
+# propagating the retiring shared-client or restricted drive.file setup.
+rclone_gdrive_profile_valid() {
+    local config_file="$1"
+
+    awk '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        /^\[[^]]+\][[:space:]]*$/ {
+            inside = ($0 == "[gdrive]")
+            if (inside) found = 1
+            next
+        }
+        inside && /^[[:space:]]*[^#;][^=]*=/ {
+            line = $0
+            key = line
+            sub(/=.*/, "", key)
+            key = trim(key)
+            sub(/^[^=]*=/, "", line)
+            value = trim(line)
+            if (key == "type" && value == "drive") type_ok = 1
+            if (key == "scope" && value == "drive") scope_ok = 1
+            if (key == "client_id" && value != "") client_id_ok = 1
+            if (key == "client_secret" && value != "") client_secret_ok = 1
+            if (key == "token" && value != "") token_ok = 1
+        }
+        END {
+            exit !(found && type_ok && scope_ok && client_id_ok && client_secret_ok && token_ok)
+        }
+    ' "$config_file"
+}
+
+rclone_gdrive_auth_state() {
+    local config_file="${1:-$(rclone_config_file)}"
+
+    if [ ! -e "$config_file" ]; then
+        printf 'missing|rclone config not found at %s' "$config_file"
+    elif [ ! -f "$config_file" ]; then
+        printf 'blocked|rclone config is not a regular file: %s' "$config_file"
+    elif [ ! -r "$config_file" ]; then
+        printf 'blocked|rclone config is not readable by the current user: %s' "$config_file"
+    elif grep -q '^RCLONE_ENCRYPT_V0:' "$config_file" 2>/dev/null; then
+        printf 'blocked|encrypted rclone configs require per-host setup and cannot be section-merged'
+    elif rclone_gdrive_profile_valid "$config_file"; then
+        printf 'deployable|%s [gdrive] -> remote rclone config' "$config_file"
+    else
+        printf 'blocked|gdrive must use type=drive, scope=drive, a personal client ID/secret, and an OAuth token'
+    fi
+}
+
+# Atomically add/replace [gdrive] while preserving every other remote. Both
+# inputs contain credentials, so this helper never prints their contents and
+# creates all intermediate state with user-only permissions.
+rclone_merge_gdrive_section() {
+    local section_file="$1" config_file="$2" config_dir tmp
+
+    [ -f "$section_file" ] && [ -r "$section_file" ] || return 1
+    rclone_gdrive_profile_valid "$section_file" || return 1
+    config_dir="$(dirname "$config_file")"
+    mkdir -p "$config_dir" || return 1
+    chmod 700 "$config_dir" 2>/dev/null || true
+
+    if [ -e "$config_file" ]; then
+        [ -f "$config_file" ] && [ ! -L "$config_file" ] && [ -r "$config_file" ] || {
+            echo "Existing rclone config is not a readable regular file: $config_file" >&2
+            return 1
+        }
+        if grep -q '^RCLONE_ENCRYPT_V0:' "$config_file" 2>/dev/null; then
+            echo "Cannot section-merge an encrypted rclone config" >&2
+            return 1
+        fi
+    fi
+
+    tmp="$(umask 077 && mktemp "$config_dir/.rclone.deploy.XXXXXX")" || return 1
+    if [ -f "$config_file" ]; then
+        awk '
+            /^\[[^]]+\][[:space:]]*$/ { inside = ($0 == "[gdrive]") }
+            !inside { print }
+        ' "$config_file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    if [ -s "$tmp" ]; then
+        # Keep the appended section separate even when the original file had
+        # no trailing newline. A harmless extra blank line is preferable to
+        # joining a comment or setting onto the section header.
+        printf '\n' >> "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    cat "$section_file" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$config_file" || { rm -f "$tmp"; return 1; }
+}
+
 delete_matching_lines() {
     local file="$1" pattern="$2" tmp
 

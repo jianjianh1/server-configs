@@ -557,6 +557,188 @@ test_auth_state_helpers() (
         fail "auth_state_api_keys should list deployable key names"
 )
 
+test_rclone_config_helpers() (
+    local tmp config section destination state mode before
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    export HOME="$tmp/home"
+    unset RCLONE_CONFIG XDG_CONFIG_HOME
+    mkdir -p "$HOME/.config/rclone"
+    config="$HOME/.config/rclone/rclone.conf"
+
+    [ "$(rclone_config_file)" = "$config" ] ||
+        fail "rclone_config_file did not select the standard config path"
+    state="$(rclone_gdrive_auth_state "$config")"
+    [ "${state%%|*}" = missing ] || fail "missing rclone config was not reported missing"
+
+    printf '%s\n' \
+        '[other]' \
+        'type = s3' \
+        'access_key_id = keep-me' \
+        '' \
+        '[gdrive]' \
+        'type = drive' \
+        'client_id = personal-client.apps.googleusercontent.com' \
+        'client_secret = fake-client-secret' \
+        'scope = drive' \
+        'token = {"access_token":"fake-access-token"}' > "$config"
+    chmod 600 "$config"
+
+    state="$(rclone_gdrive_auth_state "$config")"
+    [ "${state%%|*}" = deployable ] || fail "valid gdrive config was not deployable: $state"
+    case "$state" in
+        *fake-client-secret*|*fake-access-token*) fail "auth state exposed rclone secrets" ;;
+    esac
+
+    section="$tmp/gdrive.conf"
+    rclone_extract_remote_section "$config" gdrive > "$section"
+    rclone_gdrive_profile_valid "$section" || fail "extracted gdrive profile was not valid"
+    if grep -q '^\[other\]$' "$section"; then
+        fail "gdrive extraction included an unrelated remote"
+    fi
+
+    destination="$tmp/remote/rclone.conf"
+    mkdir -p "$(dirname "$destination")"
+    printf '%s\n' \
+        '[remote-only]' \
+        'type = sftp' \
+        'host = preserve.example' \
+        '' \
+        '[gdrive]' \
+        'type = drive' \
+        'scope = drive.file' \
+        'token = old-token' > "$destination"
+    rclone_merge_gdrive_section "$section" "$destination" || fail "gdrive section merge failed"
+    grep -q '^\[remote-only\]$' "$destination" || fail "merge removed a remote-only profile"
+    grep -q '^host = preserve.example$' "$destination" || fail "merge changed unrelated settings"
+    grep -q '^scope = drive$' "$destination" || fail "merge did not install the full-drive profile"
+    if grep -q 'old-token' "$destination"; then fail "merge retained the old gdrive token"; fi
+    [ "$(grep -c '^\[gdrive\]$' "$destination")" -eq 1 ] || fail "merge created duplicate gdrive sections"
+    mode="$(stat -c '%a' "$destination" 2>/dev/null || stat -f '%Lp' "$destination")"
+    [ "$mode" = 600 ] || fail "merged rclone config mode is $mode, expected 600"
+
+    before="$(sha256_file "$destination")"
+    printf 'RCLONE_ENCRYPT_V0:\nnot-a-real-encrypted-config\n' > "$destination"
+    if rclone_merge_gdrive_section "$section" "$destination" >/dev/null 2>&1; then
+        fail "merge accepted an encrypted destination"
+    fi
+    grep -q '^RCLONE_ENCRYPT_V0:' "$destination" || fail "failed merge changed encrypted destination"
+
+    printf '%s\n' \
+        '[gdrive]' \
+        'type = drive' \
+        'scope = drive.file' \
+        'token = restricted-token' > "$config"
+    state="$(rclone_gdrive_auth_state "$config")"
+    [ "${state%%|*}" = blocked ] || fail "restricted/shared-client config was not blocked"
+    [ -n "$before" ] || fail "sha256 helper returned an empty digest"
+)
+
+test_rclone_deploy_merges_only_gdrive() (
+    local tmp local_home remote_home config destination first_sum
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+    local_home="$tmp/local-home"
+    remote_home="$tmp/remote-home"
+    mkdir -p "$local_home/.config/rclone" "$remote_home/.config/rclone"
+    export HOME="$local_home"
+    config="$HOME/.config/rclone/rclone.conf"
+    printf '%s\n' \
+        '[local-only]' \
+        'type = dropbox' \
+        'token = do-not-copy' \
+        '' \
+        '[gdrive]' \
+        'type = drive' \
+        'client_id = personal-client.apps.googleusercontent.com' \
+        'client_secret = fake-client-secret' \
+        'scope = drive' \
+        'token = {"access_token":"fake-access-token"}' > "$config"
+    chmod 600 "$config"
+    destination="$remote_home/.config/rclone/rclone.conf"
+    printf '%s\n' \
+        '[remote-only]' \
+        'type = sftp' \
+        'host = preserve.example' > "$destination"
+
+    # shellcheck source=deploy.sh
+    . "$DIR/deploy.sh"
+    remote_exec() { HOME="$remote_home" bash -c "$1"; }
+    remote_capture() { HOME="$remote_home" bash -c "$1"; }
+    copy_local_file_to_remote() {
+        local source="$1" remote_path="$2" mode="${3:-600}" resolved
+        resolved="$(printf '%s' "$remote_path" | sed "s|^\\\$HOME|$remote_home|")"
+        mkdir -p "$(dirname "$resolved")" || return 1
+        cp "$source" "$resolved" || return 1
+        chmod "$mode" "$resolved"
+    }
+
+    FORCE_COPY=0
+    copy_gdrive_auth_to_remote "$config" >/dev/null || fail "gdrive deploy helper failed"
+    grep -q '^\[remote-only\]$' "$destination" || fail "deploy removed a remote-only profile"
+    grep -q '^\[gdrive\]$' "$destination" || fail "deploy did not add gdrive"
+    if grep -q '^\[local-only\]$' "$destination"; then fail "deploy copied an unrelated local profile"; fi
+    first_sum="$(sha256_file "$destination")"
+    copy_gdrive_auth_to_remote "$config" >/dev/null || fail "idempotent gdrive deploy failed"
+    [ "$first_sum" = "$(sha256_file "$destination")" ] || fail "idempotent deploy rewrote the config"
+)
+
+test_rclone_install_uses_managed_local_bin() (
+    local tmp curl_log
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    export HOME="$tmp/home"
+    mkdir -p "$HOME/.dotfiles-generated" "$tmp/bin"
+    INSTALL_MANIFEST="$HOME/.dotfiles-generated/install-manifest.txt"
+    : > "$INSTALL_MANIFEST"
+    curl_log="$tmp/curl.log"
+
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'out=""; url=""' \
+        'while [ $# -gt 0 ]; do' \
+        '  case "$1" in -o) out="$2"; shift 2 ;; http*) url="$1"; shift ;; *) shift ;; esac' \
+        'done' \
+        'printf "%s\n" "$url" >> "$RCLONE_TEST_CURL_LOG"' \
+        'printf "fake zip\n" > "$out"' > "$tmp/bin/curl"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'dest=""' \
+        'while [ $# -gt 0 ]; do' \
+        '  case "$1" in -d) dest="$2"; shift 2 ;; *) shift ;; esac' \
+        'done' \
+        'mkdir -p "$dest/rclone-test"' \
+        'printf "#!/usr/bin/env bash\\nprintf '\''rclone v9.9.9\\n'\''\\n" > "$dest/rclone-test/rclone"' \
+        'chmod +x "$dest/rclone-test/rclone"' > "$tmp/bin/unzip"
+    chmod +x "$tmp/bin/curl" "$tmp/bin/unzip"
+
+    export PATH="$tmp/bin:/usr/bin:/bin"
+    export RCLONE_TEST_CURL_LOG="$curl_log"
+    FORCE=false
+    NO_UPDATE=false
+    DRY_RUN=false
+    TEST_RCLONE_ARCH=x86_64
+
+    # shellcheck source=install.sh
+    . "$DIR/install.sh"
+    rclone_latest() { printf '9.9.9\n'; }
+    machine_arch() { printf '%s\n' "$TEST_RCLONE_ARCH"; }
+    report_rclone_gdrive_config() { :; }
+
+    install_rclone >/dev/null || fail "managed rclone install failed"
+    [ -x "$HOME/.local/bin/rclone" ] || fail "rclone was not installed into ~/.local/bin"
+    manifest_contains_path "$HOME/.local/bin/rclone" || fail "rclone was not recorded in the manifest"
+    grep -q 'rclone-v9.9.9-linux-amd64.zip' "$curl_log" || fail "rclone selected the wrong amd64 asset"
+
+    TEST_RCLONE_ARCH=aarch64
+    FORCE=true
+    install_rclone >/dev/null || fail "forced arm64 rclone install failed"
+    tail -1 "$curl_log" | grep -q 'rclone-v9.9.9-linux-arm64.zip' ||
+        fail "rclone selected the wrong arm64 asset"
+)
+
 test_setup_dry_run_is_non_mutating() (
     local tmp output
     tmp="$(mktemp -d)"
@@ -1179,6 +1361,9 @@ main() {
     run_test test_git_clone_command_uses_gh_only_for_credentials
     run_test test_remote_git_probe_snippet
     run_test test_auth_state_helpers
+    run_test test_rclone_config_helpers
+    run_test test_rclone_deploy_merges_only_gdrive
+    run_test test_rclone_install_uses_managed_local_bin
     run_test test_setup_dry_run_is_non_mutating
     run_test test_chpc_config_rendering_uses_repo_files
     run_test test_chpc_module_loads_initialize_module_command

@@ -29,7 +29,7 @@ On macOS, `install.sh` uses Homebrew for managed CLI tools when `brew` is alread
 
 `deploy.sh` authenticates once via SSH ControlMaster, then multiplexes all subsequent commands. Supports password, SSH key, custom key path, 2FA/DUO, and SSH config aliases. Use `--help` for full usage.
 
-GitHub CLI auth is recreated on the remote from the local `gh auth token` before cloning, bootstrapping `gh` to `~/.local/bin` on Linux remotes when needed. If the token is already stored in plaintext locally, `deploy.sh` can fall back to copying `hosts.yml`. Claude and Codex copy only known auth files (`~/.claude/.credentials.json`, `~/.codex/auth.json`); keychain-backed Claude auth is reported as non-transferable and must be set up on the remote with `claude auth login` or `claude setup-token`.
+GitHub CLI auth is recreated on the remote from the local `gh auth token` before cloning, bootstrapping `gh` to `~/.local/bin` on Linux remotes when needed. If the token is already stored in plaintext locally, `deploy.sh` can fall back to copying `hosts.yml`. Claude and Codex copy only known auth files (`~/.claude/.credentials.json`, `~/.codex/auth.json`); keychain-backed Claude auth is reported as non-transferable and must be set up on the remote with `claude auth login` or `claude setup-token`. Google Drive auth is deployed after setup by securely merging only the validated `[gdrive]` section from the local rclone config, preserving unrelated remotes.
 
 ### Uninstall
 
@@ -97,6 +97,7 @@ Both `shell/bashrc_exports` and `shell/bashrc_aliases` are sourced from `~/.bash
 | `lazygit` | Git TUI |
 | `btop` | System monitor |
 | `jq` | JSON processor |
+| `rclone` | Google Drive file transfer (`gdrive:` remote) |
 | `starship` | Cross-shell prompt |
 | `atuin` | Shell history sync and search |
 | `claude` | Claude Code CLI |
@@ -217,5 +218,6 @@ Comprehensive lookup tables for every keybinding, alias, option, and setting:
 | [docs/git.md](docs/git.md) | Git config, delta, behavior settings, all aliases (git + shell) |
 | [docs/misc-configs.md](docs/misc-configs.md) | Readline settings, dircolors |
 | [docs/ai-tools.md](docs/ai-tools.md) | Claude Code settings, Codex config, MCP servers |
+| [docs/google-drive.md](docs/google-drive.md) | rclone installation, Google Drive OAuth, deploy behavior |
 | [docs/ai-skills.md](docs/ai-skills.md) | Claude Code skills under `ai/skills/` (HPC, CUDA, MPI, LaTeX, paper review, …) |
 | [docs/chpc-allocs.md](docs/chpc-allocs.md) | `chpc-allocs` SLURM allocations & wait predictions |

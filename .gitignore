@@ -9,6 +9,8 @@
 .credentials.json
 auth.json
 hosts.yml
+rclone.conf
+client_secret_*.apps.googleusercontent.com.json
 *.pem
 *.key
 *.keystore

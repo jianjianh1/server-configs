@@ -1045,6 +1045,107 @@ install_jq() {
         "https://github.com/jqlang/jq/releases/download/${V}/jq-linux-${DEB_ARCH}" jq "$V"
 }
 
+rclone_latest() {
+    retry curl -sfL https://downloads.rclone.org/version.txt 2>/dev/null \
+        | sed -n 's/^rclone v\([0-9][0-9.]*\).*$/\1/p' \
+        | head -1
+}
+
+report_rclone_gdrive_config() {
+    local state status detail
+
+    state="$(rclone_gdrive_auth_state)"
+    status="${state%%|*}"
+    detail="${state#*|}"
+    if [ "$status" = deployable ]; then
+        echo "  Google Drive remote ready: gdrive:"
+    else
+        echo "  Google Drive auth not ready: $detail"
+        echo "    Configure it as your user with: rclone config"
+    fi
+}
+
+install_rclone() {
+    if is_macos; then
+        brew_install rclone rclone || return 1
+        report_rclone_gdrive_config
+        return 0
+    fi
+
+    local latest current current_path managed_path arch asset_arch tmp bin
+    managed_path="$HOME/.local/bin/rclone"
+    latest="$(rclone_latest)" || latest=""
+    current_path="$(command -v rclone 2>/dev/null || true)"
+    current=""
+    [ -n "$current_path" ] && current="$(tool_version rclone)"
+
+    if [ -n "$current_path" ] && ! $FORCE; then
+        if [ "$NO_UPDATE" = true ] || [ -z "$latest" ] || \
+            { [ -n "$current" ] && version_at_least "$current" "$latest"; }
+        then
+            if [ "$current_path" = "$managed_path" ]; then
+                manifest_add_path "$managed_path"
+            fi
+            if [ "$NO_UPDATE" = true ]; then
+                echo "rclone present (update check skipped): $current_path"
+            elif [ -z "$latest" ]; then
+                echo "rclone present (latest version unknown): $current_path"
+            else
+                echo "rclone up to date ($current): $current_path"
+            fi
+            report_rclone_gdrive_config
+            return 0
+        fi
+    fi
+
+    [ -n "$latest" ] || {
+        echo "  Warning: could not determine the latest rclone version"
+        return 1
+    }
+
+    arch="$(machine_arch)"
+    case "$arch" in
+        x86_64) asset_arch="amd64" ;;
+        aarch64) asset_arch="arm64" ;;
+        *) echo "  Skipping rclone (unsupported arch: $arch)"; return 1 ;;
+    esac
+
+    echo "Installing rclone $latest..."
+    tmp="$(mktemp -d)" || return 1
+    trap 'rm -rf "${tmp:-}"' RETURN
+    if ! retry curl -sfL -o "$tmp/rclone.zip" \
+        "https://downloads.rclone.org/v${latest}/rclone-v${latest}-linux-${asset_arch}.zip"
+    then
+        echo "  Warning: failed to download rclone"
+        return 1
+    fi
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q "$tmp/rclone.zip" -d "$tmp/unpacked" || return 1
+    elif command -v python3 >/dev/null 2>&1; then
+        mkdir -p "$tmp/unpacked" || return 1
+        python3 -m zipfile -e "$tmp/rclone.zip" "$tmp/unpacked" || return 1
+    else
+        echo "  Warning: rclone install needs unzip or python3"
+        return 1
+    fi
+    bin="$(find "$tmp/unpacked" -type f -name rclone | head -1)"
+    [ -n "$bin" ] || { echo "  Warning: rclone binary not found in archive"; return 1; }
+    chmod +x "$bin" || return 1
+    "$bin" version >/dev/null 2>&1 || {
+        echo "  Warning: downloaded rclone binary failed its version check"
+        return 1
+    }
+    mkdir -p "$HOME/.local/bin" || return 1
+    mv -f "$bin" "$managed_path" || return 1
+    chmod 755 "$managed_path" || return 1
+    manifest_add_path "$managed_path" || return 1
+    hash -r
+    echo "  rclone $latest installed to $managed_path"
+    [ -n "$current_path" ] && [ "$current_path" != "$managed_path" ] && \
+        echo "  Preserved external rclone at $current_path"
+    report_rclone_gdrive_config
+}
+
 # Latest Node.js LTS version string (e.g. "v22.4.0"), or empty on failure.
 # Prefer jq, then python3. No grep fallback — the nodejs.org JSON layout is
 # compact but not stable enough for regex, and python3 is effectively always
@@ -1968,6 +2069,7 @@ setup_main() {
     # caller can rely on jq being present.
     run_step "gh"           install_gh_cli
     run_step "jq"           install_jq
+    run_step "rclone"       install_rclone
     run_step "glow"         install_glow
     run_step "gum"          install_gum
     run_step "node"         install_node

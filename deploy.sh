@@ -93,6 +93,10 @@ local_gh_hosts_file() {
     printf "%s/hosts.yml" "$(local_gh_config_dir)"
 }
 
+local_rclone_config_file() {
+    rclone_config_file
+}
+
 local_gh_hosts_has_token() {
     local hosts_file="$1"
 
@@ -153,6 +157,10 @@ auth_state_api_keys() {
     else
         printf "missing|ANTHROPIC_API_KEY and OPENAI_API_KEY are not set"
     fi
+}
+
+auth_state_rclone() {
+    rclone_gdrive_auth_state "${1:-$(local_rclone_config_file)}"
 }
 
 auth_state_status() {
@@ -267,6 +275,68 @@ copy_local_file_to_remote() {
     [ -n "$remote_log" ] && rm -f "$remote_log"
     [ "$ok" -eq 1 ] && return 0
     return 1
+}
+
+copy_gdrive_auth_to_remote() {
+    local local_config="$1" tmp section_file local_sum remote_sum remote_stage
+    local profile_fn merge_fn extract_fn
+
+    tmp="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/deploy.rclone.$$.XXXXXX")" || return 1
+    section_file="$tmp/gdrive.conf"
+    if ! rclone_extract_remote_section "$local_config" gdrive > "$section_file" || \
+        [ ! -s "$section_file" ] || ! rclone_gdrive_profile_valid "$section_file"
+    then
+        rm -rf "$tmp"
+        error "Local gdrive profile is missing or invalid"
+        return 1
+    fi
+    chmod 600 "$section_file" || { rm -rf "$tmp"; return 1; }
+    local_sum="$(sha256_file "$section_file" 2>/dev/null || true)"
+
+    extract_fn="$(declare -f rclone_extract_remote_section)"
+    remote_sum="$(remote_capture "
+        $extract_fn
+        config=\"\$HOME/.config/rclone/rclone.conf\"
+        if [ -r \"\$config\" ] && [ ! -L \"\$config\" ]; then
+            if command -v sha256sum >/dev/null 2>&1; then
+                rclone_extract_remote_section \"\$config\" gdrive | sha256sum | awk '{print \$1}'
+            elif command -v shasum >/dev/null 2>&1; then
+                rclone_extract_remote_section \"\$config\" gdrive | shasum -a 256 | awk '{print \$1}'
+            fi
+        fi
+    " 2>/dev/null || true)"
+    if [ "${FORCE_COPY:-0}" != 1 ] && [ -n "$local_sum" ] && [ "$local_sum" = "$remote_sum" ]; then
+        echo "    (unchanged — skipping gdrive auth)"
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    remote_stage="\$HOME/.config/rclone/.gdrive.deploy.$$"
+    if ! remote_exec 'mkdir -p "$HOME/.config/rclone" && chmod 700 "$HOME/.config/rclone"'; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! copy_local_file_to_remote "$section_file" "$remote_stage" 600; then
+        remote_exec "rm -f \"$remote_stage\"" >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    profile_fn="$(declare -f rclone_gdrive_profile_valid)"
+    merge_fn="$(declare -f rclone_merge_gdrive_section)"
+    if ! remote_exec "
+        $profile_fn
+        $merge_fn
+        rclone_merge_gdrive_section \"$remote_stage\" \"\$HOME/.config/rclone/rclone.conf\"
+        rc=\$?
+        rm -f \"$remote_stage\"
+        exit \$rc
+    "; then
+        remote_exec "rm -f \"$remote_stage\"" >/dev/null 2>&1 || true
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
 }
 
 ensure_remote_env_keys_loader() {
@@ -911,12 +981,25 @@ API_KEYS_DETAIL="$(auth_state_detail "$API_KEYS_STATE")"
 HAS_API_KEYS=false
 [ "$API_KEYS_STATUS" = "deployable" ] && HAS_API_KEYS=true
 
+# Google Drive (rclone)
+LOCAL_RCLONE_CONFIG_FILE="$(local_rclone_config_file)"
+RCLONE_AUTH_STATE="$(auth_state_rclone "$LOCAL_RCLONE_CONFIG_FILE")"
+RCLONE_AUTH_STATUS="$(auth_state_status "$RCLONE_AUTH_STATE")"
+RCLONE_AUTH_DETAIL="$(auth_state_detail "$RCLONE_AUTH_STATE")"
+HAS_RCLONE_AUTH=false
+[ "$RCLONE_AUTH_STATUS" = "deployable" ] && HAS_RCLONE_AUTH=true
+
 # Print scan results
 [ ${#LOCAL_SSH_KEYS[@]} -gt 0 ] && success "${#LOCAL_SSH_KEYS[@]} SSH key pair(s) found" || warn "No SSH keys found"
 case "$GH_AUTH_STATUS" in
     deployable) success "GitHub CLI auth deployable ($GH_AUTH_DETAIL)" ;;
     blocked) warn "GitHub CLI auth not transferable: $GH_AUTH_DETAIL" ;;
     *) printf "  ${DIM}- GitHub CLI auth: %s${RESET}\n" "$GH_AUTH_DETAIL" ;;
+esac
+case "$RCLONE_AUTH_STATUS" in
+    deployable) success "Google Drive auth deployable ($RCLONE_AUTH_DETAIL)" ;;
+    blocked) warn "Google Drive auth not transferable: $RCLONE_AUTH_DETAIL" ;;
+    *) printf "  ${DIM}- Google Drive auth: %s${RESET}\n" "$RCLONE_AUTH_DETAIL" ;;
 esac
 case "$CLAUDE_AUTH_STATUS" in
     deployable) success "Claude Code auth deployable ($CLAUDE_AUTH_DETAIL)" ;;
@@ -952,6 +1035,7 @@ add_step() {
 add_step "SSH keys"              "$([ ${#LOCAL_SSH_KEYS[@]} -gt 0 ] && echo yes || echo no)" "off"
 add_step "GitHub CLI auth"       "$([ "$HAS_GH_AUTH" = true ] && echo yes || echo no)"      "on"
 add_step "Clone repo & install.sh" "yes"                                                      "on"
+add_step "Google Drive auth"     "$([ "$HAS_RCLONE_AUTH" = true ] && echo yes || echo no)"  "on"
 add_step "Claude Code auth"      "$([ "$HAS_CLAUDE_AUTH" = true ] && echo yes || echo no)"  "on"
 add_step "Codex auth"            "$([ "$HAS_CODEX_AUTH" = true ] && echo yes || echo no)"   "on"
 add_step "API keys (env vars)"   "$([ "$HAS_API_KEYS" = true ] && echo yes || echo no)"    "on"
@@ -1050,16 +1134,21 @@ if [ "${STEPS_SELECTED[1]}" = "on" ]; then
     auth_transfer_count=$((auth_transfer_count + 1))
 fi
 if [ "${STEPS_SELECTED[3]}" = "on" ]; then
+    echo "    - Google Drive: $RCLONE_AUTH_DETAIL"
+    echo "      verify: rclone lsd gdrive:"
+    auth_transfer_count=$((auth_transfer_count + 1))
+fi
+if [ "${STEPS_SELECTED[4]}" = "on" ]; then
     echo "    - Claude Code: $CLAUDE_AUTH_DETAIL"
     echo "      verify: claude auth status / claude -p 'ping'"
     auth_transfer_count=$((auth_transfer_count + 1))
 fi
-if [ "${STEPS_SELECTED[4]}" = "on" ]; then
+if [ "${STEPS_SELECTED[5]}" = "on" ]; then
     echo "    - Codex: $CODEX_AUTH_DETAIL"
     echo "      verify: codex login status"
     auth_transfer_count=$((auth_transfer_count + 1))
 fi
-if [ "${STEPS_SELECTED[5]}" = "on" ]; then
+if [ "${STEPS_SELECTED[6]}" = "on" ]; then
     echo "    - API keys: $API_KEYS_DETAIL"
     echo "      values are never printed"
     auth_transfer_count=$((auth_transfer_count + 1))
@@ -1172,6 +1261,39 @@ step_gh_auth() {
         success "GitHub CLI credentials copied and verified"
     else
         error "GitHub CLI credentials copied but auth did not verify"
+        return 1
+    fi
+}
+
+step_rclone_auth() {
+    section "Google Drive Auth"
+
+    if [ "${RCLONE_AUTH_STATUS:-missing}" != "deployable" ]; then
+        error "Google Drive auth is not deployable"
+        echo "    ${RCLONE_AUTH_DETAIL:-not detected}"
+        return 1
+    fi
+    if [ ! -r "$LOCAL_RCLONE_CONFIG_FILE" ]; then
+        error "Local rclone config is not readable"
+        echo "    Expected: $LOCAL_RCLONE_CONFIG_FILE"
+        return 1
+    fi
+    if ! remote_exec "command -v rclone >/dev/null 2>&1"; then
+        error "rclone is not installed on the remote"
+        echo "    Run the clone/setup step before Google Drive auth."
+        return 1
+    fi
+
+    if ! copy_gdrive_auth_to_remote "$LOCAL_RCLONE_CONFIG_FILE"; then
+        error "Failed to deploy the gdrive profile"
+        echo "    Existing encrypted, symlinked, or unreadable remote configs are left unchanged."
+        return 1
+    fi
+
+    if remote_exec "rclone lsd gdrive: --max-depth 1 >/dev/null 2>&1"; then
+        success "Google Drive credentials copied and verified"
+    else
+        error "Google Drive credentials copied but gdrive: did not verify"
         return 1
     fi
 }
@@ -1407,7 +1529,7 @@ step_clone_setup() {
 # Execute Selected Steps
 # ============================================================
 
-STEP_FNS=(step_ssh_keys step_gh_auth step_clone_setup step_claude_auth step_codex_auth step_api_keys)
+STEP_FNS=(step_ssh_keys step_gh_auth step_clone_setup step_rclone_auth step_claude_auth step_codex_auth step_api_keys)
 
 for i in "${!STEPS[@]}"; do
     [ "${STEPS_SELECTED[$i]}" = "on" ] || continue
